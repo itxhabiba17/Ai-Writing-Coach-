@@ -15,7 +15,9 @@ from groq import (
     APIConnectionError,
     APIStatusError,
     AuthenticationError,
+    BadRequestError,
     Groq,
+    NotFoundError,
     RateLimitError,
 )
 
@@ -29,7 +31,19 @@ except ImportError:  # python-dotenv is optional
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-MODEL_NAME = "llama-3.3-70b-versatile"
+# llama-3.3-70b-versatile was shut down by Groq on 16 Aug 2026, so we use its
+# recommended replacements. You can override the first choice with the
+# GROQ_MODEL environment variable. Models are tried in order if one is unavailable.
+MODEL_CANDIDATES = [
+    m
+    for m in [
+        os.getenv("GROQ_MODEL", "").strip(),
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b",
+        "openai/gpt-oss-20b",
+    ]
+    if m
+]
 MAX_CHARS = 5000
 
 STYLE_OPTIONS = {
@@ -217,16 +231,33 @@ def analyze_writing(paragraph: str, style: str, api_key: str) -> dict:
         "Return the JSON now."
     )
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=3000,
-        response_format={"type": "json_object"},
-    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    response = None
+    last_error = None
+    for model in MODEL_CANDIDATES:
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_completion_tokens": 6000,
+            "response_format": {"type": "json_object"},
+        }
+        if model.startswith("openai/gpt-oss"):
+            kwargs["reasoning_effort"] = "low"  # faster, leaves room for the answer
+        try:
+            response = client.chat.completions.create(**kwargs)
+            break
+        except (NotFoundError, BadRequestError) as e:
+            # Model missing / decommissioned / unsupported option -> try the next one
+            last_error = e
+            continue
+
+    if response is None:
+        raise last_error if last_error else ValueError("No available model.")
 
     raw = response.choices[0].message.content or ""
     data = json.loads(raw)
